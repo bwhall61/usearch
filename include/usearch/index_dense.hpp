@@ -539,14 +539,8 @@ class index_dense_gt {
     using add_result_t = typename index_t::add_result_t;
     using stats_t = typename index_t::stats_t;
     using match_t = typename index_t::match_t;
+    using neighbors_result_t = typename index_t::neighbors_result_t; 
 
-    /**
-     *  @brief  A search result, containing the found keys and distances.
-     *
-     *  As the `index_dense_gt` manages the thread-pool on its own, the search result
-     *  preserves the thread-lock to avoid undefined behaviors, when other threads
-     *  start overwriting the results.
-     */
     struct search_result_t : public index_t::search_result_t {
         inline search_result_t(index_dense_gt const& parent) noexcept
             : index_t::search_result_t(), lock_(parent, 0, false) {}
@@ -722,6 +716,8 @@ class index_dense_gt {
     member_citerator_t cend() const { return typed_->cend(); }
     member_iterator_t begin() { return typed_->begin(); }
     member_iterator_t end() { return typed_->end(); }
+
+    key_t key_from_node_id(std::size_t slot) { return typed_->key_from_node_id(slot); }
 
     stats_t stats() const { return typed_->stats(); }
     stats_t stats(std::size_t level) const { return typed_->stats(level); }
@@ -941,6 +937,39 @@ class index_dense_gt {
     void reserve(index_limits_t limits) {
         if (!try_reserve(limits))
             __usearch_raise_runtime_error("failed to reserve memory");
+    }
+
+    neighbors_result_t get_neighbors(std::size_t node_idx, std::int16_t level) {
+        return typed_->get_neighbors(node_idx, level);
+    }
+
+    struct get_id_result_t {
+        error_t error{};
+        size_t node_id;
+
+        explicit operator bool() const noexcept { return !error; }
+        get_id_result_t failed(error_t message) noexcept {
+            error = std::move(message);
+            return std::move(*this);
+        }
+    };
+
+    get_id_result_t get_id_from_key(vector_key_t key) const {
+        get_id_result_t result;
+        if (!multi()) {
+            compressed_slot_t slot;
+            {
+                shared_lock_t lock(slot_lookup_mutex_);
+                auto it = slot_lookup_.find(key_and_slot_t::any_slot(key));
+                if (it == slot_lookup_.end())
+                    return result.failed("Could not find the key");
+                slot = (*it).slot;
+            }
+            result.node_id = static_cast<size_t>(slot);
+            return result;
+        } else {
+            return result.failed("Please don't make me write this function for multi indices");
+        }
     }
 
     /**

@@ -47,6 +47,9 @@ using dense_labeling_result_t = typename index_dense_t::labeling_result_t;
 using dense_cluster_result_t = typename index_dense_t::cluster_result_t;
 using dense_clustering_result_t = typename index_dense_t::clustering_result_t;
 
+using neighbors_result_t = typename index_dense_t::neighbors_result_t;
+using dense_id_result_t = typename index_dense_t::get_id_result_t;
+
 using progress_func_t = std::function<bool(std::size_t /*processed*/, std::size_t /*total*/)>;
 
 struct progress_t {
@@ -116,11 +119,13 @@ static dense_index_py_t make_index(             //
     metric_punned_signature_t metric_signature, //
     std::uintptr_t metric_uintptr,              //
     bool multi,                                 //
-    bool enable_key_lookups) {
+    bool enable_key_lookups,
+    bool exclude_vectors) {
 
     index_dense_config_t config(connectivity, expansion_add, expansion_search);
     config.multi = multi;
     config.enable_key_lookups = enable_key_lookups;
+    config.exclude_vectors = exclude_vectors;
 
     metric_t metric =  //
         metric_uintptr //
@@ -256,6 +261,93 @@ static void add_many_to_index(                            //
     default: throw std::invalid_argument("Incompatible scalars in the vectors matrix: " + vectors_info.format);
     }
     // clang-format on
+}
+
+template <typename index_at>
+static py::array_t<std::size_t> get_neighbors(
+    index_at& index,
+    int node_id,
+    int level) {
+
+    std::vector<std::size_t> neighbor_info;
+    neighbors_result_t neighbors = index.get_neighbors(node_id, level);
+
+    for (std::size_t i=0; i < neighbors.size(); ++i){
+        std::size_t neighbor_id = neighbors[i];
+        std::size_t neighbor_key = static_cast<std::size_t>(index.key_from_node_id(neighbor_id));
+        neighbor_info.push_back(neighbor_id);
+        neighbor_info.push_back(neighbor_key);
+    }
+
+    return py::array_t<std::size_t>(neighbor_info.size(), neighbor_info.data());
+
+}
+
+template <typename index_at>
+static py::array_t<std::size_t> get_top_level_nodes(index_at& index) {
+    std::size_t max_level = index.max_level();
+    
+    std::vector<std::size_t> top_level_node_info;
+    for (auto i = index.cbegin(); i != index.cend(); ++i){
+        int level = i.level();
+        if (level == max_level){
+            std::size_t node_id = i.slot();
+            std::size_t node_key = i.key();
+            top_level_node_info.push_back(node_id);
+            top_level_node_info.push_back(node_key);
+        }
+    }
+    return py::array_t<std::size_t>(top_level_node_info.size(), top_level_node_info.data());
+}
+
+template <typename index_at>
+static py::array_t<Py_ssize_t> get_id_from_keys(
+    index_at& index,
+    py::buffer keys) {
+        
+    py::buffer_info keys_info = keys.request();
+    if (keys_info.ndim != 1)
+        throw std::invalid_argument("Keys must be placed in a single-dimensional array!");
+
+    Py_ssize_t keys_count = keys_info.shape[0];
+    byte_t const* keys_data = reinterpret_cast<byte_t const*>(keys_info.ptr);
+
+    py::array_t<Py_ssize_t> result_py({keys_count});
+    auto result_ptr = result_py.mutable_data();
+
+    for (Py_ssize_t task_idx = 0; task_idx != keys_count; ++task_idx){
+        dense_key_t key = *reinterpret_cast<dense_key_t const*>(keys_data + task_idx * keys_info.strides[0]);
+        dense_id_result_t result = index.get_id_from_key(key);
+
+        result_ptr[task_idx] = static_cast<Py_ssize_t>(result.node_id);
+    }
+
+    return result_py;
+}
+
+template <typename index_at>
+static py::array_t<Py_ssize_t> get_keys_from_node_ids(
+    index_at& index,
+    py::buffer node_ids) {
+        
+    py::buffer_info node_ids_info = node_ids.request();
+    if (node_ids_info.ndim != 1)
+        throw std::invalid_argument("Node IDS must be placed in a single-dimensional array!");
+
+    Py_ssize_t node_ids_count = node_ids_info.shape[0];
+    byte_t const* node_ids_data = reinterpret_cast<byte_t const*>(node_ids_info.ptr);
+
+    py::array_t<Py_ssize_t> result_py({node_ids_count});
+    auto result_ptr = result_py.mutable_data();
+
+    for (Py_ssize_t task_idx = 0; task_idx != node_ids_count; ++task_idx){
+        std::size_t node_id = *reinterpret_cast<std::size_t const*>(node_ids_data + task_idx * node_ids_info.strides[0]);
+        std::size_t result = index.key_from_node_id(node_id);
+
+        result_ptr[task_idx] = static_cast<Py_ssize_t>(result);
+    }
+
+    return result_py;
 }
 
 template <typename scalar_at>
@@ -1081,7 +1173,8 @@ PYBIND11_MODULE(compiled, m) {
         py::arg("metric_signature") = metric_punned_signature_t::array_array_k, //
         py::arg("metric_pointer") = 0,                                          //
         py::arg("multi") = false,                                               //
-        py::arg("enable_key_lookups") = true                                    //
+        py::arg("enable_key_lookups") = true,                                   //
+        py::arg("exclude_vectors") = false
     );
 
     i.def(                                                //
@@ -1101,6 +1194,24 @@ PYBIND11_MODULE(compiled, m) {
         py::arg("exact") = false,                               //
         py::arg("threads") = 0,                                 //
         py::arg("progress") = nullptr                           //
+    );
+
+    i.def("get_node_ids_from_keys", &get_id_from_keys<dense_index_py_t>,
+        py::arg("keys")
+    );
+
+    i.def("get_keys_from_node_ids", &get_keys_from_node_ids<dense_index_py_t>,
+        py::arg("node_ids")
+    );
+
+    i.def(
+        "get_neighbors", &get_neighbors<dense_index_py_t>,
+        py::arg("node_id"),
+        py::arg("level")
+    );
+
+    i.def(
+        "get_top_level_nodes", &get_top_level_nodes<dense_index_py_t>
     );
 
     i.def(                                                     //

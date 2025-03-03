@@ -70,10 +70,12 @@ else:
     TypeAlias = object  # Fallback for older Python versions
 
 Key: TypeAlias = np.uint64
+NodeID: TypeAlias = np.uint64
 
 NoneType: TypeAlias = type(None)
 
 KeyOrKeysLike = Union[Key, Iterable[Key], int, Iterable[int], np.ndarray, memoryview]
+NodeIDOrNodeIDsLike = Union[NodeID, Iterable[NodeID], int, Iterable[int], np.ndarray, memoryview]
 
 VectorOrVectorsLike = Union[np.ndarray, Iterable[np.ndarray], memoryview]
 
@@ -488,6 +490,7 @@ class Index:
         path: Optional[os.PathLike] = None,
         view: bool = False,
         enable_key_lookups: bool = True,
+        exclude_vectors: bool = False,
     ) -> None:
         """Construct the index and compiles the functions, if requested (expensive).
 
@@ -576,6 +579,7 @@ class Index:
             expansion_search=expansion_search,
             multi=multi,
             enable_key_lookups=enable_key_lookups,
+            exclude_vectors=exclude_vectors,
             metric_kind=self._metric_kind,
             metric_pointer=self._metric_pointer,
             metric_signature=self._metric_signature,
@@ -715,6 +719,42 @@ class Index:
             progress=progress,
         )
 
+    def get_neighbors(self, node_id, level):
+        return self._compiled.get_neighbors(node_id, level)
+    
+    def get_top_level_nodes(self):
+        return self._compiled.get_top_level_nodes()
+
+    def get_keys_from_node_ids(
+            self,
+            node_ids: NodeIDOrNodeIDsLike,
+    ):
+        is_one = not isinstance(node_ids, Iterable)
+        if is_one:
+            node_ids = [node_ids]
+        if not isinstance(node_ids, np.ndarray):
+            node_ids = np.array(node_ids, dtype=NodeID)
+        else:
+            node_ids = node_ids.astype(NodeID)
+
+        results = self._compiled.get_keys_from_node_ids(node_ids)
+        return results[0] if is_one else results
+
+    def get_node_ids_from_keys(
+        self,
+        keys: KeyOrKeysLike,
+    ):
+        is_one = not isinstance(keys, Iterable)
+        if is_one:
+            keys = [keys]
+        if not isinstance(keys, np.ndarray):
+            keys = np.array(keys, dtype=Key)
+        else:
+            keys = keys.astype(Key)
+
+        results = self._compiled.get_node_ids_from_keys(keys)
+        return results[0] if is_one else results
+
     def contains(self, keys: KeyOrKeysLike) -> Union[bool, np.ndarray]:
         if isinstance(keys, Iterable):
             return self._compiled.contains_many(np.array(keys, dtype=Key))
@@ -729,7 +769,7 @@ class Index:
             return self._compiled.count_many(np.array(keys, dtype=Key))
         else:
             return self._compiled.count_one(int(keys))
-
+    
     def get(
         self,
         keys: KeyOrKeysLike,

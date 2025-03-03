@@ -98,11 +98,7 @@
 #include <thread>    // `std::thread`
 #include <utility>   // `std::pair`
 
-// Helper macros for concatenation and stringification
-#define usearch_concat_helper_m(a, b) a##b
-#define usearch_concat_m(a, b) usearch_concat_helper_m(a, b)
-#define usearch_stringify_helper_m(x) #x
-#define usearch_stringify_m(x) usearch_stringify_helper_m(x)
+#include <vector>
 
 // Prefetching
 #if defined(USEARCH_DEFINED_GCC)
@@ -1987,6 +1983,7 @@ class index_gt {
     using compressed_slot_t = compressed_slot_at;
     using dynamic_allocator_t = dynamic_allocator_at;
     using tape_allocator_t = tape_allocator_at;
+    using level_t = std::int16_t;
     static_assert(sizeof(vector_key_t) >= sizeof(compressed_slot_t), "Having tiny keys doesn't make sense.");
     static_assert(std::is_signed<distance_t>::value, "Distance must be a signed type, as we use the unary minus.");
 
@@ -2019,7 +2016,10 @@ class index_gt {
         using reference = ref_t;
 
         reference operator*() const noexcept { return call_key<0>(std::is_const<index_t>()); }
+
         vector_key_t key() const noexcept { return index_->node_at_(slot_).ckey(); }
+        level_t level() const noexcept { return index_->node_at_(slot_).level(); }
+        compressed_slot_t slot() const noexcept { return slot_; }
 
         friend inline compressed_slot_t get_slot(member_iterator_gt const& it) noexcept { return it.slot_; }
         friend inline vector_key_t get_key(member_iterator_gt const& it) noexcept { return it.key(); }
@@ -2073,7 +2073,6 @@ class index_gt {
      *          alignment in most common cases.
      */
     using neighbors_count_t = std::uint32_t;
-    using level_t = std::int16_t;
 
     /**
      *  @brief  How many bytes of memory are needed to form the "head" of the node.
@@ -2396,6 +2395,8 @@ class index_gt {
     member_iterator_t begin() noexcept { return {this, static_cast<compressed_slot_t>(0u)}; }
     member_iterator_t end() noexcept { return {this, static_cast<compressed_slot_t>(size())}; }
 
+    vector_key_t key_from_node_id(compressed_slot_t slot) noexcept { return node_at_(slot).key(); }
+
     member_ref_t at(compressed_slot_t slot) noexcept { return {nodes_[slot].key(), slot}; }
     member_cref_t at(compressed_slot_t slot) const noexcept { return {nodes_[slot].ckey(), slot}; }
     member_iterator_t iterator_at(compressed_slot_t slot) noexcept { return {this, slot}; }
@@ -2684,6 +2685,28 @@ class index_gt {
             return std::move(*this);
         }
     };
+
+
+    using neighbors_result_t = std::vector<compressed_slot_t>;
+    template <typename node_at, typename level_at> 
+    neighbors_result_t get_neighbors(
+        node_at node_id,
+        level_at level) {
+         
+        node_t node = node_at_(node_id);
+        neighbors_ref_t neighbor_ref = neighbors_(node, level);
+        
+        neighbors_result_t neighbors;
+        neighbors.reserve(neighbor_ref.size());
+
+        for (std::size_t i = 0; i < neighbor_ref.size(); ++i){
+            neighbors.push_back(neighbor_ref[i]);
+        }
+
+        return neighbors;
+    }
+    
+
 
     /**
      *  @brief  Inserts a new entry into the index. Thread-safe. Supports @b heterogeneous lookups.
