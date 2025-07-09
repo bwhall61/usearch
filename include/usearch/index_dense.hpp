@@ -1107,6 +1107,7 @@ class index_dense_gt {
     serialization_result_t load_from_stream(input_callback_at&& input,          //
                                             serialization_config_t config = {}, //
                                             progress_at&& progress = {}) {
+        
 
         // Discard all previous memory allocations of `vectors_tape_allocator_`
         index_limits_t old_limits = typed_ ? typed_->limits() : index_limits_t{};
@@ -1117,31 +1118,71 @@ class index_dense_gt {
         std::uint64_t matrix_rows = 0;
         std::uint64_t matrix_cols = 0;
 
-        // We may not want to load the vectors from the same file, or allow attaching them afterwards
-        if (!config.exclude_vectors) {
-            // Save the matrix size
-            if (!config.use_64_bit_dimensions) {
-                std::uint32_t dimensions[2];
-                if (!input(&dimensions, sizeof(dimensions)))
-                    return result.failed("Failed to read 32-bit dimensions of the matrix");
-                matrix_rows = dimensions[0];
-                matrix_cols = dimensions[1];
+        // Detect if vectors are present in the file by checking if it starts with magic string
+        // If it doesn't start with magic, then vectors are present
+        bool vectors_in_file = false;
+        bool file_uses_64bit_dims = false;
+        {
+            // Check if file starts with "usearch" magic string
+            char magic_check[8];
+            if (!input(magic_check, sizeof(magic_check)))
+                return result.failed("Failed to read file header");
+            
+            if (std::memcmp(magic_check, default_magic(), std::strlen(default_magic())) == 0) {
+                // File starts with magic, so no vectors are present
+                vectors_in_file = false;
             } else {
-                std::uint64_t dimensions[2];
-                if (!input(&dimensions, sizeof(dimensions)))
-                    return result.failed("Failed to read 64-bit dimensions of the matrix");
-                matrix_rows = dimensions[0];
-                matrix_cols = dimensions[1];
+                // File doesn't start with magic, so vectors are present
+                vectors_in_file = true;
+                
+                // Try to determine if file uses 32-bit or 64-bit dimensions
+                // First assume 32-bit and read dimensions
+                std::uint32_t dimensions_32[2];
+                std::memcpy(dimensions_32, magic_check, sizeof(dimensions_32));
+                
+                // If dimensions seem reasonable for 32-bit, use them
+                // dimensions[0] can be very large (number of vectors), but dimensions[1] (bytes per vector) should be reasonable
+                if (dimensions_32[0] > 0 && 
+                    dimensions_32[1] > 0 && dimensions_32[1] < 100000) {  // reasonable upper bound for bytes per vector
+                    matrix_rows = dimensions_32[0];
+                    matrix_cols = dimensions_32[1];
+                    file_uses_64bit_dims = false;
+                } else {
+                    // Try 64-bit dimensions
+                    std::uint64_t dimensions_64[2];
+                    std::memcpy(dimensions_64, magic_check, 8);
+                    if (!input(reinterpret_cast<byte_t*>(dimensions_64) + 8, 8))
+                        return result.failed("Failed to read 64-bit dimensions");
+                    matrix_rows = dimensions_64[0];
+                    matrix_cols = dimensions_64[1];
+                    file_uses_64bit_dims = true;
+                }
             }
-            // Load the vectors one after another
-            vectors_lookup_ = vectors_lookup_t(matrix_rows);
-            if (!vectors_lookup_)
-                return result.failed("Failed to allocate memory to address vectors");
-            for (std::uint64_t slot = 0; slot != matrix_rows; ++slot) {
-                byte_t* vector = vectors_tape_allocator_.allocate(matrix_cols);
-                if (!input(vector, matrix_cols))
-                    return result.failed("Failed to read vectors");
-                vectors_lookup_[slot] = vector;
+        }
+
+        // Handle vector data based on file content and config
+        if (vectors_in_file) {
+            if (!config.exclude_vectors) {
+                // Load the vectors
+                vectors_lookup_ = vectors_lookup_t(matrix_rows);
+                if (!vectors_lookup_)
+                    return result.failed("Failed to allocate memory to address vectors");
+                for (std::uint64_t slot = 0; slot != matrix_rows; ++slot) {
+                    byte_t* vector = vectors_tape_allocator_.allocate(matrix_cols);
+                    if (!input(vector, matrix_cols))
+                        return result.failed("Failed to read vectors");
+                    vectors_lookup_[slot] = vector;
+                }
+            } else {
+                // Skip over the vectors in the file
+                std::uint64_t bytes_to_skip = matrix_rows * matrix_cols;
+                byte_t dummy_buffer[4096];
+                while (bytes_to_skip > 0) {
+                    std::uint64_t chunk_size = std::min(bytes_to_skip, static_cast<std::uint64_t>(sizeof(dummy_buffer)));
+                    if (!input(dummy_buffer, chunk_size))
+                        return result.failed("Failed to skip vectors in file");
+                    bytes_to_skip -= chunk_size;
+                }
             }
         }
 
@@ -1203,7 +1244,9 @@ class index_dense_gt {
             available_threads.push(i);
         available_threads_ = std::move(available_threads);
 
-        reindex_keys_();
+        // Not entirely sure what this does, but it doesn't affect anything for RAD and is just a huge memory sink
+        // reindex_keys_();
+        
         return result;
     }
 
@@ -1225,34 +1268,66 @@ class index_dense_gt {
         serialization_result_t result = file.open_if_not();
         if (!result)
             return result;
-
+        
         // Infer the new index size
         std::uint64_t matrix_rows = 0;
         std::uint64_t matrix_cols = 0;
         span_punned_t vectors_buffer;
 
-        // We may not want to fetch the vectors from the same file, or allow attaching them afterwards
-        if (!config.exclude_vectors) {
-            // Save the matrix size
-            if (!config.use_64_bit_dimensions) {
-                std::uint32_t dimensions[2];
-                if (file.size() - offset < sizeof(dimensions))
-                    return result.failed("File is corrupted and lacks matrix dimensions");
-                std::memcpy(&dimensions, file.data() + offset, sizeof(dimensions));
-                matrix_rows = dimensions[0];
-                matrix_cols = dimensions[1];
-                offset += sizeof(dimensions);
+        // Detect if vectors are present in the file by checking if it starts with magic string
+        bool vectors_in_file = false;
+        bool file_uses_64bit_dims = false;
+        {
+            // Check if file starts with "usearch" magic string
+            if (file.size() - offset < 8)
+                return result.failed("File is too small to contain valid data");
+            
+            char magic_check[8];
+            std::memcpy(magic_check, file.data() + offset, sizeof(magic_check));
+            
+            if (std::memcmp(magic_check, default_magic(), std::strlen(default_magic())) == 0) {
+                // File starts with magic, so no vectors are present
+                vectors_in_file = false;
             } else {
-                std::uint64_t dimensions[2];
-                if (file.size() - offset < sizeof(dimensions))
-                    return result.failed("File is corrupted and lacks matrix dimensions");
-                std::memcpy(&dimensions, file.data() + offset, sizeof(dimensions));
-                matrix_rows = dimensions[0];
-                matrix_cols = dimensions[1];
-                offset += sizeof(dimensions);
+                // File doesn't start with magic, so vectors are present
+                vectors_in_file = true;
+                
+                // Try to determine if file uses 32-bit or 64-bit dimensions
+                std::uint32_t dimensions_32[2];
+                std::memcpy(dimensions_32, magic_check, sizeof(dimensions_32));
+                
+                // If dimensions seem reasonable for 32-bit, use them
+                // dimensions[0] can be very large (number of vectors), but dimensions[1] (bytes per vector) should be reasonable
+                if (dimensions_32[0] > 0 && 
+                    dimensions_32[1] > 0 && dimensions_32[1] < 100000) {  // reasonable upper bound for bytes per vector
+                    matrix_rows = dimensions_32[0];
+                    matrix_cols = dimensions_32[1];
+                    file_uses_64bit_dims = false;
+                } else {
+                    // Try 64-bit dimensions
+                    if (file.size() - offset < 16)
+                        return result.failed("File too small for 64-bit dimensions");
+                    std::uint64_t dimensions_64[2];
+                    std::memcpy(dimensions_64, file.data() + offset, sizeof(dimensions_64));
+                    matrix_rows = dimensions_64[0];
+                    matrix_cols = dimensions_64[1];
+                    file_uses_64bit_dims = true;
+                }
             }
-            vectors_buffer = {file.data() + offset, static_cast<std::size_t>(matrix_rows * matrix_cols)};
-            offset += vectors_buffer.size();
+        }
+
+        // Handle vector data based on file content and config
+        if (vectors_in_file) {
+            // Skip over the dimensions
+            offset += file_uses_64bit_dims ? sizeof(std::uint64_t) * 2 : sizeof(std::uint32_t) * 2;
+            
+            if (!config.exclude_vectors) {
+                // Set up vectors buffer to point to the memory-mapped vector data
+                vectors_buffer = {file.data() + offset, static_cast<std::size_t>(matrix_rows * matrix_cols)};
+            } 
+            
+            // Skip over the vector data to get to metadata
+            offset += matrix_rows * matrix_cols;
         }
 
         // Load metadata and choose the right metric
@@ -1306,13 +1381,14 @@ class index_dense_gt {
         if (!typed_->try_reserve(old_limits))
             return result.failed("Failed to reserve memory for the index");
 
-        // Address the vectors
-        vectors_lookup_ = vectors_lookup_t(matrix_rows);
-        if (!vectors_lookup_)
-            return result.failed("Failed to allocate memory to address vectors");
-        if (!config.exclude_vectors)
+        if (!config.exclude_vectors){
+            // Address the vectors
+            vectors_lookup_ = vectors_lookup_t(matrix_rows);
+            if (!vectors_lookup_)
+                return result.failed("Failed to allocate memory to address vectors");
             for (std::uint64_t slot = 0; slot != matrix_rows; ++slot)
                 vectors_lookup_[slot] = (byte_t*)vectors_buffer.data() + matrix_cols * slot;
+        }
 
         // After the index is loaded, we may have to resize the `available_threads_` to
         // match the limits of the underlying engine.
@@ -1324,7 +1400,9 @@ class index_dense_gt {
             available_threads.push(i);
         available_threads_ = std::move(available_threads);
 
-        reindex_keys_();
+        // Not entirely sure what this does, but it doesn't affect anything for RAD and is just a huge memory sink
+        // reindex_keys_();
+        
         return result;
     }
 

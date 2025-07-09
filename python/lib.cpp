@@ -71,7 +71,11 @@ struct dense_index_py_t : public index_dense_t {
     using native_t::search;
     using native_t::size;
 
-    dense_index_py_t(native_t&& base) : index_dense_t(std::move(base)) {}
+    bool exclude_vectors_setting = false;
+
+    dense_index_py_t(native_t&& base, bool exclude_vectors = false) 
+        : index_dense_t(std::move(base)), exclude_vectors_setting(exclude_vectors) {
+    }
 };
 
 struct dense_indexes_py_t {
@@ -139,7 +143,7 @@ static dense_index_py_t make_index(             //
     if (!state)
         throw std::invalid_argument(state.error.release());
 
-    return std::move(state.index);
+    return dense_index_py_t(std::move(state.index), exclude_vectors);
 }
 
 scalar_kind_t numpy_string_to_kind(std::string const& name) {
@@ -897,7 +901,7 @@ static dense_index_py_t copy_index(dense_index_py_t const& index, bool force_cop
     config.force_vector_copy = force_copy;
     copy_result_t result = index.copy(config);
     forward_error(result);
-    return std::move(result.index);
+    return dense_index_py_t(std::move(result.index), index.exclude_vectors_setting);
 }
 
 static void compact_index(dense_index_py_t& index, std::size_t threads, progress_func_t const& progress) {
@@ -933,9 +937,21 @@ static py::dict index_metadata(index_dense_metadata_result_t const& meta) {
 }
 
 // clang-format off
-template <typename index_at> void save_index_to_path(index_at const& index, std::string const& path, progress_func_t const& progress) { index.save(path.c_str(), {}, progress_t{progress}).error.raise(); }
-template <typename index_at> void load_index_from_path(index_at& index, std::string const& path, progress_func_t const& progress) { index.load(path.c_str(), {}, progress_t{progress}).error.raise(); }
-template <typename index_at> void view_index_from_path(index_at& index, std::string const& path, progress_func_t const& progress) { index.view(path.c_str(), 0, {}, progress_t{progress}).error.raise(); }
+template <typename index_at> void save_index_to_path(index_at const& index, std::string const& path, progress_func_t const& progress) { 
+    typename index_at::serialization_config_t config;
+    config.exclude_vectors = index.exclude_vectors_setting;
+    index.save(path.c_str(), config, progress_t{progress}).error.raise(); 
+}
+template <typename index_at> void load_index_from_path(index_at& index, std::string const& path, progress_func_t const& progress) { 
+    typename index_at::serialization_config_t config;
+    config.exclude_vectors = index.exclude_vectors_setting;
+    index.load(path.c_str(), config, progress_t{progress}).error.raise(); 
+}
+template <typename index_at> void view_index_from_path(index_at& index, std::string const& path, progress_func_t const& progress) { 
+    typename index_at::serialization_config_t config;
+    config.exclude_vectors = index.exclude_vectors_setting;
+    index.view(path.c_str(), 0, config, progress_t{progress}).error.raise(); 
+}
 template <typename index_at> void reset_index(index_at& index) { index.reset(); }
 template <typename index_at> void clear_index(index_at& index) { index.clear(); }
 template <typename index_at> std::size_t max_level(index_at const &index) { return index.max_level(); }
@@ -950,7 +966,9 @@ template <typename py_bytes_at> memory_mapped_file_t memory_map_from_bytes(py_by
 }
 
 template <typename index_at> py::object save_index_to_buffer(index_at const& index, progress_func_t const& progress) {
-    std::size_t serialized_length = index.serialized_length();
+    typename index_at::serialization_config_t config;
+    config.exclude_vectors = index.exclude_vectors_setting;
+    std::size_t serialized_length = index.serialized_length(config);
 
     // Create an empty bytearray object using CPython API
     PyObject* byte_array = PyByteArray_FromStringAndSize(nullptr, 0);
@@ -965,7 +983,7 @@ template <typename index_at> py::object save_index_to_buffer(index_at const& ind
 
     char* buffer = PyByteArray_AS_STRING(byte_array);
     memory_mapped_file_t memory_map((byte_t*)buffer, serialized_length);
-    serialization_result_t result = index.save(std::move(memory_map), {}, {}, progress_t{progress});
+    serialization_result_t result = index.save(std::move(memory_map), 0, config, progress_t{progress});
 
     if (!result) {
         Py_XDECREF(byte_array);
@@ -977,7 +995,9 @@ template <typename index_at> py::object save_index_to_buffer(index_at const& ind
 
 template <typename index_at>
 void load_index_from_buffer(index_at& index, py::bytes const& buffer, progress_func_t const& progress) {
-    index.load(memory_map_from_bytes(buffer), {}, {}, progress_t{progress}).error.raise();
+    typename index_at::serialization_config_t config;
+    config.exclude_vectors = index.exclude_vectors_setting;
+    index.load(memory_map_from_bytes(buffer), 0, config, progress_t{progress}).error.raise();
 }
 template <typename index_at>
 void view_index_from_buffer(index_at& index, py::bytes const& buffer, progress_func_t const& progress) {
