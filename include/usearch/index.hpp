@@ -3749,12 +3749,17 @@ class index_gt {
     inline node_t node_at_(std::size_t idx) const noexcept { return nodes_[idx]; }
     inline neighbors_ref_t neighbors_base_(node_t node) const noexcept { return {node.neighbors_tape()}; }
 
-    inline neighbors_ref_t neighbors_non_base_(node_t node, level_t level) const noexcept {
-        usearch_assert_m(level > 0 && level <= node.level(), "Linking to missing level");
+    inline neighbors_ref_t neighbors_non_base_(node_t node, level_t level) const {
+        // Replace usearch_assert_m with proper exception throwing to prevent segfaults
+        if (level <= 0 || level > node.level()) {
+            throw std::invalid_argument("Level " + std::to_string(level) + 
+                                      " is out of range for node (max level: " + 
+                                      std::to_string(node.level()) + ")");
+        }
         return {node.neighbors_tape() + pre_.neighbors_base_bytes + (level - 1) * pre_.neighbors_bytes};
     }
 
-    inline neighbors_ref_t neighbors_(node_t node, level_t level) const noexcept {
+    inline neighbors_ref_t neighbors_(node_t node, level_t level) const {
         return level ? neighbors_non_base_(node, level) : neighbors_base_(node);
     }
 
