@@ -940,6 +940,14 @@ class index_dense_gt {
     }
 
     neighbors_result_t get_neighbors(std::size_t node_idx, std::int16_t level) {
+        // Validate node_idx is within bounds before calling underlying index
+        if (node_idx >= size()) {
+            throw std::invalid_argument("node_idx " + std::to_string(node_idx) + 
+                                      " is out of range (size: " + std::to_string(size()) + ")");
+        }
+        if (level < 0) {
+            throw std::invalid_argument("level must be non-negative");
+        }
         return typed_->get_neighbors(node_idx, level);
     }
 
